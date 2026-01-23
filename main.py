@@ -5,7 +5,7 @@ import threading, json, math, time, os
 from collections import defaultdict, deque
 from ipwhois.asn import IPASN
 from ipwhois.net import Net
-from google import genai  # Latest 2026 SDK
+from google import genai 
 from dotenv import load_dotenv
 
 # --- Initialization ---
@@ -13,6 +13,7 @@ load_dotenv()
 try:
     from ai_model import ai_predict
 except ImportError:
+    # Safe fallback if ai_model.py is not in current directory
     def ai_predict(features): return "Benign", 0.95
 
 # ---------- Configuration & Theme ----------
@@ -22,12 +23,13 @@ ACCENT_GREEN = "#238636"
 ACCENT_RED = "#da3633"   
 TEXT_MAIN = "#c9d1d9"    
 WHITELIST_FILE = "dns_whitelist.txt"
+FAST_FLUX_WINDOW = 60
+MAX_ROWS = 100
 FEATURE_NAMES = ["domain_length", "entropy", "digit_ratio", "subdomain_depth", "ttl", "unique_ip_count", "query_rate"]
 
 domain_cache = defaultdict(lambda: {"ips": set(), "timestamps": deque(maxlen=50)})
 asn_cache = {}
 packet_details = {} 
-MAX_ROWS = 100
 
 # ---------- Whitelist Logic (Feedback Loop) ----------
 def load_whitelist():
@@ -43,30 +45,42 @@ def add_to_whitelist(domain):
         with open(WHITELIST_FILE, "a") as f:
             f.write(f"{domain}\n")
 
-# ---------- Logic Engines ----------
+def remove_from_whitelist(domain):
+    if domain in whitelist:
+        whitelist.remove(domain)
+        with open(WHITELIST_FILE, "w") as f:
+            for d in whitelist:
+                f.write(f"{d}\n")
+        return True
+    return False
+
+# ---------- Detection & Logic Engines ----------
 def shannon_entropy(data):
     if not data: return 0
     freq = {c: data.count(c) for c in set(data)}
     return -sum((count / len(data)) * math.log2(count / len(data)) for count in freq.values())
+
+def get_asn_diversity(ip_list):
+    if not ip_list: return 0
+    asns = set()
+    for ip in ip_list:
+        if ip in asn_cache: 
+            asns.add(asn_cache[ip])
+            continue
+        try:
+            res = IPASN(Net(ip)).lookup()
+            asn = res.get('asn')
+            asn_cache[ip] = asn
+            asns.add(asn)
+        except: pass
+    return len(asns) / len(ip_list) if ip_list else 0
 
 def get_explanation(features):
     exps = []
     if features[1] > 4.5: exps.append("HIGH ENTROPY")
     if features[4] < 120 and features[5] > 5: exps.append("IP CHURN")
     if features[2] > 0.3: exps.append("DIGIT DENSITY")
-    return " | ".join(exps) if exps else "COMPLEX BEHAVIOR"
-
-def get_asn_diversity(ip_list):
-    if not ip_list: return 0
-    asns = set()
-    for ip in ip_list:
-        if ip in asn_cache: asns.add(asn_cache[ip]); continue
-        try:
-            asn = IPASN(Net(ip)).lookup().get('asn')
-            asn_cache[ip] = asn
-            asns.add(asn)
-        except: pass
-    return len(asns) / len(ip_list) if ip_list else 0
+    return " | ".join(exps) if exps else "AI-DETECTED ANOMALY"
 
 def analyze_threat_with_llm(packet_data):
     api_key = os.getenv("GOOGLE_API_KEY")
@@ -84,7 +98,7 @@ def analyze_threat_with_llm(packet_data):
         return response.text
     except Exception as e: return f"Forensic Offline: {str(e)}"
 
-# ---------- GUI Setup ----------
+# ---------- GUI Logic ----------
 root = tk.Tk()
 root.title("DNS SENTINEL | SOC ANALYZER")
 root.geometry("1200x850")
@@ -101,7 +115,15 @@ def trigger_llm():
         detail_box.insert(tk.END, analyze_threat_with_llm(packet_details[sel[0]]) + "\n")
         detail_box.see(tk.END)
 
+def clear_full_whitelist():
+    global whitelist
+    whitelist = set()
+    if os.path.exists(WHITELIST_FILE):
+        os.remove(WHITELIST_FILE)
+    detail_box.insert(tk.END, "\n[SYSTEM] GLOBAL WHITELIST PURGED.\n")
+
 tk.Button(header, text="DEEP ANALYSIS", bg=ACCENT_GREEN, fg="white", font=("Consolas", 9, "bold"), command=trigger_llm).pack(side="right", padx=10)
+tk.Button(header, text="CLEAR WHITELIST", bg="#444d56", fg="white", font=("Consolas", 8), command=clear_full_whitelist).pack(side="right", padx=5)
 tk.Label(header, text="STATUS: ACTIVE", font=("Consolas", 9), fg="#8b949e", bg=BG_DARK).pack(side="right")
 
 style = ttk.Style()
@@ -127,6 +149,7 @@ detail_box.pack(fill="both", padx=10, pady=10)
 
 # ---------- Right-Click Context Menu ----------
 popup_menu = tk.Menu(root, tearoff=0, bg=BG_PANEL, fg=TEXT_MAIN, font=("Consolas", 10))
+
 def mark_false_positive():
     sel = tree.selection()
     if sel:
@@ -135,37 +158,70 @@ def mark_false_positive():
         add_to_whitelist(domain)
         tree.item(item_id, tags=("benign",))
         tree.set(item_id, column="status", value="WHITELISTED")
-        detail_box.insert(tk.END, f"\n[!] FEEDBACK: {domain} Whitelisted.\n")
+
+def unwhitelist_selected():
+    sel = tree.selection()
+    if sel:
+        item_id = sel[0]
+        domain = packet_details[item_id]['query_info']['domain']
+        if remove_from_whitelist(domain):
+            tree.set(item_id, column="status", value="RE-EVALUATED")
 
 popup_menu.add_command(label="Mark as False Positive (Whitelist)", command=mark_false_positive)
+popup_menu.add_command(label="Remove from Whitelist", command=unwhitelist_selected)
 tree.bind("<Button-3>", lambda e: tree.identify_row(e.y) and (tree.selection_set(tree.identify_row(e.y)) or popup_menu.tk_popup(e.x_root, e.y_root)))
 
 # ---------- Packet Processing ----------
+
+
 def parse_dns(pkt):
-    if pkt.haslayer(DNS) and pkt.haslayer(IP):
+    if pkt.haslayer(DNS) and pkt.haslayer(IP) and pkt.haslayer(UDP):
         src, dst = pkt[IP].src, pkt[IP].dst
         query = pkt[DNS].qd.qname.decode().strip(".") if pkt[DNS].qd else "-"
-        ttl = pkt[DNS].an.ttl if pkt[DNS].an and hasattr(pkt[DNS].an, "ttl") else 0
         now = time.time()
+        ttl = pkt[DNS].an.ttl if pkt[DNS].an and hasattr(pkt[DNS].an, "ttl") else 0
         
-        current_ips = [str(pkt[DNS].an[i].rdata) for i in range(pkt[DNS].ancount) if hasattr(pkt[DNS].an[i], "rdata")]
-        for ip in current_ips: domain_cache[query]["ips"].add(ip)
+        current_ips = []
+        if pkt[DNS].an:
+            for i in range(pkt[DNS].ancount):
+                rr = pkt[DNS].an[i]
+                if hasattr(rr, "rdata"):
+                    ip_str = str(rr.rdata)
+                    domain_cache[query]["ips"].add(ip_str)
+                    current_ips.append(ip_str)
+        
         domain_cache[query]["timestamps"].append(now)
+        ip_count = len(domain_cache[query]["ips"])
+        query_count = len([t for t in domain_cache[query]["timestamps"] if now - t < FAST_FLUX_WINDOW])
 
-        features = [len(query), shannon_entropy(query), sum(c.isdigit() for c in query)/max(len(query), 1), query.count("."), ttl, len(domain_cache[query]["ips"]), len(domain_cache[query]["timestamps"])]
+        # 1. Feature Extraction
+        features = [len(query), shannon_entropy(query), sum(c.isdigit() for c in query)/max(len(query), 1), 
+                    query.count("."), ttl, ip_count, query_count]
+        
+        # 2. Hybrid Decision Engine
         ai_label, conf = ai_predict(features)
         div = get_asn_diversity(current_ips)
         
         status, tag = "Benign", "benign"
-        if query in whitelist: status = "WHITELISTED"
+        if query in whitelist:
+            status = "WHITELISTED"
         elif ai_label != "Benign" and conf > 0.5:
-            if ai_label == "Fast-Flux" and div < 0.3: status = "Benign (CDN)"
-            else: status, tag = ai_label.upper(), "malicious"
-
+            if ai_label == "Fast-Flux" and div < 0.3:
+                status = "Benign (CDN)"
+            else:
+                status, tag = ai_label.upper(), "malicious"
+        
+        # 3. GUI Update
         bar = f"[{'■'*int(conf*10)}{'□'*(10-int(conf*10))}] {int(conf*100)}%"
         item_id = tree.insert("", "end", values=(src, dst, query, ttl, bar, status), tags=(tag,))
-        packet_details[item_id] = {"query_info": {"domain": query, "ttl": ttl}, "network_context": {"asn_diversity": round(div, 2)}, "ai_analysis": {"label": ai_label, "confidence": conf, "explanation": get_explanation(features)}}
-        if len(tree.get_children()) > MAX_ROWS: tree.delete(tree.get_children()[0])
+        packet_details[item_id] = {
+            "query_info": {"domain": query, "ttl": ttl, "ips": current_ips},
+            "network_context": {"asn_diversity": round(div, 2)},
+            "ai_analysis": {"label": ai_label, "confidence": conf, "explanation": get_explanation(features)},
+            "raw_features": dict(zip(FEATURE_NAMES, features))
+        }
+        if len(tree.get_children()) > MAX_ROWS:
+            tree.delete(tree.get_children()[0])
 
 tree.bind("<<TreeviewSelect>>", lambda e: tree.selection() and (detail_box.delete("1.0", tk.END) or detail_box.insert(tk.END, f">>> INSPECTION: {packet_details[tree.selection()[0]]['query_info']['domain']}\n" + json.dumps(packet_details[tree.selection()[0]], indent=4))))
 threading.Thread(target=lambda: sniff(filter="udp port 53", prn=parse_dns, store=False), daemon=True).start()
